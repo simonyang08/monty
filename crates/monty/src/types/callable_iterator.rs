@@ -83,10 +83,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, CallableIterator> {
         None
     }
 
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
     fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
         let self_id = self_id.expect("heap values have an id");
         vm.heap.inc_ref(self_id);

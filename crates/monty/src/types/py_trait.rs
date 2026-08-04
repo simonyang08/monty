@@ -68,7 +68,7 @@ impl From<AttrCallResult> for CallResult {
 /// One of Python's six rich-comparison operations.
 ///
 /// Identity and containment operators use separate protocols and deliberately
-/// cannot reach [`PyTrait::py_rich_compare_impl`].
+/// cannot reach the rich-comparison vtable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RichCmpOp {
     /// Less than (`<`).
@@ -116,6 +116,18 @@ impl RichCmpOp {
         matches!(self, Self::Eq | Self::Ne)
     }
 
+    /// Returns the special method implementing this operation on an instance.
+    pub(crate) fn dunder(self) -> &'static str {
+        match self {
+            Self::Lt => "__lt__",
+            Self::Le => "__le__",
+            Self::Eq => "__eq__",
+            Self::Ne => "__ne__",
+            Self::Gt => "__gt__",
+            Self::Ge => "__ge__",
+        }
+    }
+
     /// Evaluates this operation against an existing total ordering.
     pub(crate) fn holds(self, ordering: Ordering) -> bool {
         match self {
@@ -150,6 +162,90 @@ impl RichCmpOp {
     }
 }
 
+/// A native implementation of one rich-comparison slot.
+pub(crate) type RichCmpFn<'h, T> = fn(&T, &Value, RichCmpOp, &mut VM<'h>, Option<HeapId>) -> RunResult<Value>;
+
+/// Static rich-comparison slots exposed by a Rust value implementation.
+///
+/// A missing pointer means the type does not define that operation. Multiple
+/// slots may share one function when their type checks and comparison work are
+/// common; the operation is passed to the function for that purpose.
+pub(crate) struct RichCmpVtable<'h, T> {
+    /// Native `<` implementation, if defined.
+    lt: Option<RichCmpFn<'h, T>>,
+    /// Native `<=` implementation, if defined.
+    le: Option<RichCmpFn<'h, T>>,
+    /// Native `==` implementation, if defined.
+    eq: Option<RichCmpFn<'h, T>>,
+    /// Native `!=` implementation, if defined.
+    ne: Option<RichCmpFn<'h, T>>,
+    /// Native `>` implementation, if defined.
+    gt: Option<RichCmpFn<'h, T>>,
+    /// Native `>=` implementation, if defined.
+    ge: Option<RichCmpFn<'h, T>>,
+}
+
+impl<'h, T> RichCmpVtable<'h, T> {
+    /// A type with no native rich-comparison methods.
+    pub(crate) const EMPTY: Self = Self::new(None, None, None, None, None, None);
+
+    /// Creates an arbitrary combination of rich-comparison slots.
+    pub(crate) const fn new(
+        lt: Option<RichCmpFn<'h, T>>,
+        le: Option<RichCmpFn<'h, T>>,
+        eq: Option<RichCmpFn<'h, T>>,
+        ne: Option<RichCmpFn<'h, T>>,
+        gt: Option<RichCmpFn<'h, T>>,
+        ge: Option<RichCmpFn<'h, T>>,
+    ) -> Self {
+        Self { lt, le, eq, ne, gt, ge }
+    }
+
+    /// Exposes only equality, deriving `!=` through the same implementation.
+    pub(crate) const fn equality(compare: RichCmpFn<'h, T>) -> Self {
+        Self::new(None, None, Some(compare), Some(compare), None, None)
+    }
+
+    /// Exposes all six operations through one shared implementation.
+    pub(crate) const fn all(compare: RichCmpFn<'h, T>) -> Self {
+        Self::new(
+            Some(compare),
+            Some(compare),
+            Some(compare),
+            Some(compare),
+            Some(compare),
+            Some(compare),
+        )
+    }
+
+    /// Resolves the native function for one operation.
+    fn get(&self, op: RichCmpOp) -> Option<RichCmpFn<'h, T>> {
+        match op {
+            RichCmpOp::Lt => self.lt,
+            RichCmpOp::Le => self.le,
+            RichCmpOp::Eq => self.eq,
+            RichCmpOp::Ne => self.ne,
+            RichCmpOp::Gt => self.gt,
+            RichCmpOp::Ge => self.ge,
+        }
+    }
+}
+
+/// Invokes one statically resolved rich-comparison slot.
+pub(crate) fn invoke_rich_cmp_slot<'h>(
+    receiver: &impl PyTrait<'h>,
+    other: &Value,
+    op: RichCmpOp,
+    vm: &mut VM<'h>,
+    self_id: Option<HeapId>,
+) -> RunResult<Value> {
+    if let Some(compare) = <_ as PyTrait<'h>>::RICH_COMPARE.get(op) {
+        compare(receiver, other, op, vm, self_id)
+    } else {
+        Ok(Value::NotImplemented)
+    }
+}
+
 /// Common operations for heap-allocated Python values.
 ///
 /// Implementers should provide Python-compatible semantics for all operations.
@@ -165,7 +261,10 @@ impl RichCmpOp {
 /// The lifetime `'h` is the heap borrow lifetime. For concrete types (e.g. `Dict`,
 /// `List`) this is unused and should be `'_`. For `HeapRead<'h, T>` implementers
 /// the lifetime connects the read handle to the VM's heap reference.
-pub(crate) trait PyTrait<'h> {
+pub(crate) trait PyTrait<'h>: Sized {
+    /// Native rich-comparison methods supplied by this type.
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::EMPTY;
+
     /// Returns the Python type name for this value (e.g., "list", "str").
     ///
     /// Used for error messages and the `type()` builtin.
@@ -203,42 +302,6 @@ pub(crate) trait PyTrait<'h> {
     /// `self_id` is only needed by types that re-enter the VM (`Instance`).
     fn py_contains_impl(&self, _self_id: HeapId, _item: &Value, _vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         Ok(None)
-    }
-
-    /// One-sided equality normalized for identity-or-equality operations.
-    ///
-    /// Returns `Some(bool)` when this type handles `other`, or `None` for
-    /// `NotImplemented`. User instances preserve arbitrary `__eq__` results in
-    /// [`py_rich_compare_impl`](Self::py_rich_compare_impl) instead.
-    ///
-    /// Cross-type equality (e.g. `int`/`float`, `namedtuple`/`tuple`,
-    /// `dict_keys`/`set`) is handled here in-situ: each type inspects `other`
-    /// directly. For containers this performs element-wise comparison using the
-    /// heap to resolve nested references; `&mut VM` allows lazy hash computation
-    /// for dict key lookups and access to interned string content.
-    ///
-    /// Recursion depth is tracked via `vm.recursion_guard()`; returns
-    /// `Err(ResourceError::Recursion)` if maximum depth is exceeded.
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>>;
-
-    /// Runs one side of Python's rich-comparison protocol.
-    ///
-    /// Any Python value is a valid handled result. [`Value::NotImplemented`]
-    /// asks the caller to try the reflected operation on `other`; the default
-    /// adapts existing boolean equality implementations and declines ordering.
-    /// `self_id` lets ID-dependent heap types such as Counters re-enter the VM.
-    fn py_rich_compare_impl(
-        &self,
-        other: &Value,
-        op: RichCmpOp,
-        vm: &mut VM<'h>,
-        _self_id: Option<HeapId>,
-    ) -> RunResult<Value> {
-        if op.is_equality() {
-            Ok(op.equality_result(self.py_eq_impl(other, vm)?))
-        } else {
-            Ok(Value::NotImplemented)
-        }
     }
 
     /// Returns the truthiness of the value following Python semantics.

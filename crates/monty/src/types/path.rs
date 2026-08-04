@@ -25,7 +25,7 @@ use crate::{
     heap::{DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
     os_dispatch::{build_path_os_call, is_path_os_method},
-    types::{LazyHeapSet, List, PyTrait, Type, allocate_tuple, str::allocate_string},
+    types::{LazyHeapSet, List, PyTrait, RichCmpOp, RichCmpVtable, Type, allocate_tuple, str::allocate_string},
     value::{EitherStr, Value},
 };
 
@@ -440,7 +440,20 @@ impl Path {
     }
 }
 
+impl<'h> HeapRead<'h, Path> {
+    /// Compares normalized virtual paths.
+    #[expect(clippy::unnecessary_wraps)]
+    fn rich_eq(&self, other: &Value, op: RichCmpOp, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Value> {
+        let Some(HeapReadOutput::Path(other)) = other.read_heap(vm) else {
+            return Ok(Value::NotImplemented);
+        };
+        Ok(op.equality_result(Some(self.get(vm.heap).path == other.get(vm.heap).path)))
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::equality(Self::rich_eq);
+
     fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Path
     }
@@ -448,13 +461,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
     fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {
         // Paths don't have a length in Python
         None
-    }
-
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::Path(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        Ok(Some(self.get(vm.heap).path == other.get(vm.heap).path))
     }
 
     fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fmt::Write, mem};
 
-use super::{Dict, LazyHeapSet, PyTrait, Type, attribute_name_value};
+use super::{Dict, LazyHeapSet, PyTrait, RichCmpOp, RichCmpVtable, Type, attribute_name_value};
 use crate::{
     args::{ArgValues, KwargsValues},
     builtins::Builtins,
@@ -75,9 +75,26 @@ impl<'h> HeapRead<'h, Instance> {
     pub fn set_attr(&mut self, name: Value, value: Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         self.attrs_mut().set(name, value, vm)
     }
+
+    /// Resolves and invokes the class special method for one rich comparison.
+    ///
+    /// Missing `__ne__` derives from `__eq__`; any other missing method declines
+    /// the operation. Lookup occurs immediately before invocation so mutations
+    /// made by the left comparison are visible to reflected dispatch.
+    fn rich_compare(
+        _receiver: &Self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        instance_rich_compare(self_id.expect("heap values have an id"), other, op, vm)
+    }
 }
 
 impl<'h> PyTrait<'h> for HeapRead<'h, Instance> {
+    const RICH_COMPARE: RichCmpVtable<'h, Self> = RichCmpVtable::all(Self::rich_compare);
+
     /// The class's `__contains__`, or `None` when it defines none — `in` then
     /// falls back to iteration, matching CPython's `sq_contains` before `tp_iter`.
     fn py_contains_impl(&self, self_id: HeapId, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
@@ -99,12 +116,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Instance> {
         let old_value = self.set_attr(name, value, vm)?;
         old_value.drop_with(vm);
         Ok(())
-    }
-
-    /// Returns `NotImplemented`; comparisons dispatch at the `Value` level because
-    /// user and synthesized dataclass equality require the instance's `HeapId`.
-    fn py_eq_impl(&self, _other: &Value, _vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
     }
 
     /// Hashes an instance, following CPython's precedence.
@@ -341,10 +352,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, BoundMethod> {
 
     fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {
         None
-    }
-
-    fn py_eq_impl(&self, _other: &Value, _vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
     }
 
     fn py_hash(&self, self_id: HeapId, _vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
@@ -637,27 +644,60 @@ fn instance_class(self_id: HeapId, vm: &VM<'_>) -> HeapId {
     }
 }
 
-/// Dispatches a user-defined `__eq__`, or `Ok(None)` when it is absent.
+/// Runs one side of rich comparison for a user instance.
+fn instance_rich_compare(self_id: HeapId, other: &Value, op: RichCmpOp, vm: &mut VM<'_>) -> RunResult<Value> {
+    if let Some(result) = instance_user_rich_compare(self_id, other, op, vm)? {
+        Ok(result)
+    } else {
+        match op {
+            RichCmpOp::Eq => {
+                if matches!(other, Value::Ref(other_id) if self_id == *other_id) {
+                    Ok(Value::Bool(true))
+                } else if let Some(equal) = instance_dataclass_eq(self_id, other, vm)? {
+                    Ok(Value::Bool(equal))
+                } else {
+                    Ok(Value::NotImplemented)
+                }
+            }
+            RichCmpOp::Ne => {
+                let result = instance_rich_compare(self_id, other, RichCmpOp::Eq, vm)?;
+                if result.is_not_implemented() {
+                    Ok(result)
+                } else {
+                    defer_drop!(result, vm);
+                    Ok(Value::Bool(!result.py_bool(vm)?))
+                }
+            }
+            _ => Ok(Value::NotImplemented),
+        }
+    }
+}
+
+/// Dispatches one user-defined rich-comparison method, or reports its absence.
 ///
-/// The user's value is preserved so direct equality can return it unchanged;
-/// callers interpret `NotImplemented` according to their comparison mode.
-pub(crate) fn instance_user_eq(self_id: HeapId, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<Value>> {
-    if !matches!(vm.heap.get(self_id), HeapData::Instance(_)) {
-        return Ok(None);
+/// The user's value, including `NotImplemented`, is preserved for the bilateral
+/// protocol driver. The borrowed other operand is cloned because the call owns
+/// its arguments.
+fn instance_user_rich_compare(
+    self_id: HeapId,
+    other: &Value,
+    op: RichCmpOp,
+    vm: &mut VM<'_>,
+) -> RunResult<Option<Value>> {
+    let dunder = op.dunder();
+    if class_defines(instance_class(self_id, vm), dunder, vm) {
+        let other = other.clone_with_heap(vm.heap);
+        instance_call_dunder_sync(self_id, dunder, Some(other), vm)
+    } else {
+        Ok(None)
     }
-    let class_id = instance_class(self_id, vm);
-    if !class_defines(class_id, "__eq__", vm) {
-        return Ok(None);
-    }
-    let other = other.clone_with_heap(vm.heap);
-    instance_call_dunder_sync(self_id, "__eq__", Some(other), vm)
 }
 
 /// Dispatches the synthesized field-wise `__eq__` of a dataclass instance, or
 /// `Ok(None)` when `self_id` is not one, which leaves the caller on identity.
 ///
-/// Not in `HeapRead<Instance>::py_eq_impl` because fields are read as
-/// `self.field` is (see [`instance_attr`]), which needs the instance's `HeapId`.
+/// Kept outside the native instance slot because fields are read as `self.field`
+/// is (see [`instance_attr`]), which needs the instance's `HeapId`.
 pub(crate) fn instance_dataclass_eq(self_id: HeapId, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
     if !matches!(vm.heap.get(self_id), HeapData::Instance(_)) {
         return Ok(None);
