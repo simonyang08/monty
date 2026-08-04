@@ -28,7 +28,7 @@ use crate::{
     hash::{HashValue, hash_python_long_int},
     heap::{Heap, HeapData, HeapId, HeapRead},
     resource_checks::{check_div_size, check_lshift_size, check_mult_size, check_pow_size},
-    types::{LazyHeapSet, PyTrait, Type, str::allocate_string},
+    types::{LazyHeapSet, PyTrait, RichCmpOp, Type, str::allocate_string},
     value::{Value, eq_bigint},
 };
 
@@ -407,6 +407,28 @@ impl<'h> PyTrait<'h> for HeapRead<'h, LongInt> {
 
     fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         Ok(eq_bigint(self.get(vm.heap).inner(), other, vm))
+    }
+
+    fn py_rich_compare_impl(
+        &self,
+        other: &Value,
+        op: RichCmpOp,
+        vm: &mut VM<'h>,
+        _self_id: Option<HeapId>,
+    ) -> RunResult<Value> {
+        if op.is_equality() {
+            return Ok(op.equality_result(self.py_eq_impl(other, vm)?));
+        }
+        let lhs = self.get(vm.heap);
+        let ordering = match other {
+            Value::Bool(rhs) => Some(bigint_cmp_i64(lhs.inner(), i64::from(*rhs))),
+            Value::Int(rhs) => Some(bigint_cmp_i64(lhs.inner(), *rhs)),
+            Value::Float(rhs) => lhs.partial_cmp_f64(*rhs),
+            Value::InternLongInt(rhs) => Some(lhs.inner().cmp(vm.interns.get_long_int(*rhs))),
+            Value::Ref(id) if let HeapData::LongInt(rhs) = vm.heap.get(*id) => Some(lhs.inner().cmp(rhs.inner())),
+            _ => return Ok(Value::NotImplemented),
+        };
+        Ok(Value::Bool(ordering.is_some_and(|ordering| op.holds(ordering))))
     }
 
     fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
